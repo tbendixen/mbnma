@@ -3,7 +3,7 @@ title: "From Bucher to Bayes"
 subtitle: "A Brief Introduction to Bayesian Model-Based Network Meta-Analysis for Indirect Treatment Comparisons using R"
 author:
   - Theiss Bendixen
-date: today
+date: "2026-06-05"
 date-modified: today
 project:
   type: website
@@ -31,7 +31,7 @@ format:
           }
         </style>
 editor: visual
-bibliography: [bib.bib]
+bibliography: [bib.bib, grateful-refs.bib]
 ---
 
 ```{r setup, include=FALSE}
@@ -50,7 +50,7 @@ options(warn = 1,
 
 # Introduction
 
-It's common for meta-analyses in the clinical trial literature to lump together studies with different doses, follow-up times, or populations. One common workaround is to stratify the meta-analysis into subgroups. But often we can do better than that and instead model the dependencies or discrepancies explicitly. The potential payoff is increased statistical precision.
+It's common for meta-analyses in the clinical trial literature to lump together studies with different doses, follow-up times, or populations. One common workaround is to stratify the meta-analysis into subgroups. But often we can do better than that and instead model the dependencies or discrepancies explicitly. One potential payoff is increased statistical precision.
 
 In this post, I'll give a brief introduction to Bayesian model-based network meta-analysis (MBNMA) to model studies on different dose levels of the same drug and show how it can be used to inform an indirect treatment comparison between competitive drugs that have not been studied in the same trial. We simulate data to keep the example agnostic of therapy area.
 
@@ -81,13 +81,13 @@ The evidence network looks like this:
 Solid edges are the direct randomised comparisons against placebo. The dashed edge between Drug A 1 mg and Drug B 1 mg is the indirect comparison we're after. 
 
 ## The Bucher method
-The "Bucher method" [@bucher1997] takes the dose 1 mg estimate of Drug A and the 1 mg estimate of Drug B and subtracts them. Variances are combined by addition. Standard errors of the treatment differences are reconstructed from the confidence intervals.
+The "Bucher method" [@bucher1997] takes the dose 1 mg estimate of Drug A and the 1 mg estimate of Drug B and subtracts them, and the confidence interval is constructed by adding the variances of the two trial estimates.
 
 ```{r bucher}
-delta    <- -4 - (-3)
+delta  <- -4 - (-3)
 delta_se <- sqrt(0.6^2 + 0.2^2)
-ci_lo    <- delta - delta_se * qnorm(0.975)
-ci_up    <- delta + delta_se * qnorm(0.975)
+ci_lo <- delta - delta_se * qnorm(0.975)
+ci_up <- delta + delta_se * qnorm(0.975)
 
 round(data.frame(delta, ci_lo, ci_up), 1)
 ```
@@ -128,7 +128,7 @@ Combining the Emax structure with a meta-analytic likelihood gives the model:
   \sigma             &\sim \text{Exponential}(4)
 \end{aligned}
 
-The first two lines are a standard random-effects meta-analysis: For the effect of the two dose levels of Drug A, the observed point estimates $Y_{\text{obs}, i}$ are normally distributed around unobserved true study means $Y_{\text{true}, i}$, with each trial's reported standard error $Y_{\text{se}, i}$ reflecting sampling variability. The true means themselves come from a population of true means with mean $\mu$ and between-trial heterogeneity $\sigma$. This notation comes from @mcelreath_statistical_2020 [ch. 15], which frames it as a measurement error model. In the third line, $\mu$ is given its own structural shape, namely the Emax model.
+The first two lines are a standard random-effects meta-analysis: For the effect of the two dose levels of Drug A, the observed point estimates $Y_{\text{obs}, i}$ are normally distributed around unobserved true study means $Y_{\text{true}, i}$, with each trial's reported standard error $Y_{\text{se}, i}$ reflecting sampling variability. The true means themselves come from a population of true means with mean $\mu$ and between-trial heterogeneity $\sigma$. This notation comes from @mcelreath_statistical_2020 [ch. 15], who frames it as a measurement error model: the observed estimates are measurements of the true study-level effects but they are measured with error. In the third line, $\mu$ is given its own structural shape, namely the Emax model.
 
 This gives us three parameters -- the $E_{\max}$ and $ED_{50}$ as well as the between-trial heterogeneity $\sigma$ -- to estimate from two data points. But this is no problem for Bayes. The minimum sample size for a Bayesian analysis is 0 (we'll just get the prior back). But it does mean that the priors will exert some influence.
 
@@ -153,7 +153,7 @@ library(ggplot2)
 
 set.seed(2)
 n_draws <- 30
-D_grid  <- seq(0, 3, length.out = 200)
+D_grid <- seq(0, 3, length.out = 200)
 
 draws <- lapply(1:n_draws, function(i) {
   emax     <- rnorm(1, -5.5, 0.75)
@@ -216,16 +216,16 @@ A useful diagnostic is to compare priors against posteriors for each parameter. 
 #| code-fold: true
 #| code-summary: "Show the code"
 post <- extract.samples(m_mbnma)
-n    <- length(post$Emax)
+n <- length(post$Emax)
 
-prior_Emax  <- pmin(rnorm(n, -5.5, 0.75), 0)   # respect upper=0 constraint
-prior_ED50  <- exp(rnorm(n, -1.5, 1))
+prior_Emax <- pmin(rnorm(n, -5.5, 0.75), 0)   # respect upper=0 constraint
+prior_ED50 <- exp(rnorm(n, -1.5, 1))
 prior_sigma <- rexp(n, 4)
 
 plot_prior_post <- function(prior, post_samples, title, xlim, add_legend = FALSE) {
   d_prior <- density(prior, adjust = 1.5)
-  d_post  <- density(post_samples, adjust = 1.5)
-  ylim    <- c(0, max(d_prior$y, d_post$y) * 1.1)
+  d_post <- density(post_samples, adjust = 1.5)
+  ylim <- c(0, max(d_prior$y, d_post$y) * 1.1)
   
   plot(NA, xlim = xlim, ylim = ylim,
        main = title, xlab = "", ylab = "Density",
@@ -264,7 +264,7 @@ plot_prior_post(prior_sigma, post$sigma, expression(bold(sigma)),
                 xlim = c(0, 1))
 ```
 
-The model has learned about $E_{\max}$ and $\log ED_{50}$ -- the posteriors are noticeably tighter than the priors. It has learned less about $\sigma$, which is unsurprising: with only two data points, between-study heterogeneity is hard to pin down.
+The model has learned about $E_{\max}$ and $\log ED_{50}$ -- the posteriors are tighter than the priors. It has learned less about $\sigma$, which is unsurprising: with only two data points, between-study heterogeneity is hard to pin down.
 
 ## The Emax curve and shrinkage
 
@@ -276,20 +276,20 @@ Let's plot the posterior Emax curve with the observed data overlaid, alongside t
 library(patchwork)
 
 dose_seq <- seq(0, 3, by = 0.025)
-mu       <- link(m_mbnma, data = list(D = dose_seq))
+mu <- link(m_mbnma, data = list(D = dose_seq))
 
 mu_median <- apply(mu, 2, median)
-mu_PI95   <- apply(mu, 2, PI, prob = 0.95)
+mu_PI95 <- apply(mu, 2, PI, prob = 0.95)
 
 plot_data <- data.frame(
-  dose     = dose_seq,
-  median   = mu_median,
+  dose = dose_seq,
+  median = mu_median,
   lower_95 = mu_PI95[1, ],
   upper_95 = mu_PI95[2, ]
 )
 
 obs_data <- data.frame(
-  dose  = c(1, 2),
+  dose = c(1, 2),
   Y_obs = c(-4, -4.5),
   Y_sd  = c(0.6, 0.3)
 )
@@ -318,13 +318,12 @@ mbnma_post <- ggplot() +
   coord_cartesian(ylim = c(-6, 0)) +
   theme_classic()
 
-mbnma_prior + mbnma_post +
-  plot_annotation(tag_levels = list(c("Prior predictive", "Posterior")))
+mbnma_prior + ggtitle("Prior predictive") + mbnma_post + ggtitle("Posterior")
 ```
 
 Two things are worth noting. First, we see that we did manage to increase precision on the target dose of 1 mg. The posterior interval at 1 mg is narrower than the empirical estimates, reflecting the information borrowed from the dose-response curve. Second, our inference on 2 mg remains largely unchanged -- borrowing information from 1 mg does not help us much in getting a more precise estimate for 2 mg. This is because the 2 mg trial was a much larger trial than the 1 mg trial and so there's less to learn from the latter. 
 
-## An improved indirect treatment comparison
+# An improved indirect treatment comparison
 Now, let's query the model about the posterior predictions for Drug A on 1 mg, so that we can plug this updated estimate into our indirect treatment comparison against Drug B 1 mg.
 
 ```{r mu1}
@@ -450,12 +449,9 @@ The non-centered form of a multilevel model tends to work better when data are s
 # Summary
 Exploiting a dose-response structure rather than ignoring it is one way to get more out of an evidence network. The same principle extends naturally to other dimensions along which trials differ. One such example is follow-up time: if the same treatment has been evaluated at different follow-up times across a set of trials, a longitudinal dose-response-style model can borrow information across time points in the same way we borrowed it across doses [@strathe2025model]. Another extension is "multilevel network meta-regression," which combines individual patient data with aggregate trial data to adjust indirect comparisons for differences in patient-level effect modifiers across trials [@phillippo2020multilevel].
 
-All in all, Bayes is a natural fit for these kinds of models, in that it allows uncertainty to propagate in a principled manner through evidence networks and results in a posterior that allows direct, interpretable, and decision-relevant probability statements about the relative efficacy and safety of competing clinical interventions.
+All in all, Bayes is a natural fit for these kinds of models, in that it allows uncertainty to propagate in a principled manner through evidence networks. The resulting posterior allows for direct, interpretable, and decision-relevant probability statements about the relative efficacy and safety of competing clinical interventions.
 
-## References
-
-::: {#refs}
-:::
+If you liked this post, you might also want to check out this brief introduction to ["Bayesian dynamic borrowing"](https://theissbendixen.com/bayesian-dynamic-borrowing/).
 
 # Software
 
@@ -465,7 +461,12 @@ pkgs <- cite_packages(output = "table", out.dir = ".", cite.tidyverse = TRUE, de
 knitr::kable(pkgs)
 ```
 
-## Session info
+# References
+
+::: {#refs}
+:::
+
+# Session info
 
 ```{r}
 sessionInfo()
