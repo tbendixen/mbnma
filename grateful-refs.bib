@@ -1,472 +1,391 @@
----
-title: "From Bucher to Bayes"
-subtitle: "A Brief Introduction to Bayesian Model-Based Network Meta-Analysis for Indirect Treatment Comparisons using R"
-author:
-  - Theiss Bendixen
-date: today
-date-modified: today
-project:
-  type: website
-website:
-  title: "From Bucher to Bayes"
-  site-url: "https://theissbendixen.com/mbnma/"
-  base-url: "/mbnma"
-  repo-url: "https://github.com/tbendixen/mbnma"
-format:
-  html:
-    toc: true
-    output-file: "index"
-    self-contained: true
-    include-in-header: 
-      text: |
-        <style>
-          p {
-            font-family: Libre Franklin, Helvetica, Arial, sans-serif;
-            font-size: 1rem;
-            color: #444444; 
-            }
-        body {
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-          }
-        </style>
-editor: visual
-bibliography: [bib.bib]
----
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  cache = TRUE,
-  warning = FALSE,
-  message = FALSE,
-  error = FALSE,
-  echo = TRUE,
-  cache.comments = FALSE
-)
-
-options(warn = 1,
-        buildtools.check = function(action) TRUE)
-```
-
-# Introduction
-
-It's common for meta-analyses in the clinical trial literature to lump together studies with different doses, follow-up times, or populations. One common workaround is to stratify the meta-analysis into subgroups. But often we can do better than that and instead model the dependencies or discrepancies explicitly. The potential payoff is increased statistical precision.
-
-In this post, I'll give a brief introduction to Bayesian model-based network meta-analysis (MBNMA) to model studies on different dose levels of the same drug and show how it can be used to inform an indirect treatment comparison between competitive drugs that have not been studied in the same trial. We simulate data to keep the example agnostic of therapy area.
-
-To follow along, I assume some basic familiarity with Bayesian statistics and R [@rcoreteam2024]. I'll use the `rethinking` package [@mcelreath_statistical_2020], an interface to Stan [@carpenter2017stan], because its syntax mirrors the formal model very closely and makes the structure of MBNMA easy to see.
-
-# The evidence network
-
-Suppose we have three trials:
-
-- **Trial A1**: Drug A at dose 1 mg vs. placebo. Estimated treatment difference: $-4$ (SE $\pm 0.6$). Smaller trial, $N \approx 100$.
-- **Trial A2**: Drug A at dose 2 mg vs. placebo. Estimated treatment difference: $-4.5$ (SE $\pm 0.3$). Larger trial, $N \approx 400$.
-- **Trial B1**: Drug B at dose 1 mg vs. placebo. Estimated treatment difference: $-3$ (SE $\pm 0.2$).
-
-The outcome is some continuous endpoint where lower (more negative) is better. There is no head-to-head trial of Drug A vs. Drug B but let's say they are expected to compete in the same market on their respective 1 mg dose.
-
-The evidence network looks like this:
-
-```         
-            Drug A, 2 mg
-                 |
-              placebo
-              /     \
-   Drug A, 1 mg     Drug B, 1 mg
-            \\------//
-        (indirect comparison)
-```
-
-Solid edges are the direct randomised comparisons against placebo. The dashed edge between Drug A 1 mg and Drug B 1 mg is the indirect comparison we're after. 
-
-## The Bucher method
-The "Bucher method" [@bucher1997] takes the dose 1 mg estimate of Drug A and the 1 mg estimate of Drug B and subtracts them. Variances are combined by addition. Standard errors of the treatment differences are reconstructed from the confidence intervals.
-
-```{r bucher}
-delta    <- -4 - (-3)
-delta_se <- sqrt(0.6^2 + 0.2^2)
-ci_lo    <- delta - delta_se * qnorm(0.975)
-ci_up    <- delta + delta_se * qnorm(0.975)
-
-round(data.frame(delta, ci_lo, ci_up), 1)
-```
-
-The point estimate is $-1$ and the 95% CI roughly $-2.2$ to $+0.2$. The estimate favors Drug A, but the interval just crosses zero -- it's not "statistically significant." This is where we can exploit the dose-response structure of the evidence network sketched above.
-
-The Drug A programme studied Drug A at both 1 mg and 2 mg, providing two data points on the same dose-response curve. The 2 mg estimate is substantially more precise than the 1 mg estimate, because the 2 mg trial had four times the sample size compared to the 1 mg trial. Both doses are estimating effects that arise from the same underlying pharmacology. A model that exploits this structure can allow the precision of the 2 mg estimate to flow back along the curve and improve our estimate of 1 mg.
-
-Taken together, this setup -- multiple trials sharing a common comparator -- is the structure of a *network* meta-analysis: by treating the trials as a connected network rather than a set of isolated pairwise comparisons, we can estimate effects between treatments that have not been directly compared in the same trial [@lu2004combination; @lumley2002network]. The "model-based" bit in MBNMA refers to the additional structure we layer on top [@mawdsley2016model] -- here, a dose–response curve linking the two Drug A trials.
-
-Let's start by collecting the data in a list.
-
-```{r dlist}
-dlist <- list(D = c(1.0, 2.0),
-              Y_obs = c(-4, -4.5),
-              Y_se = c(0.6, 0.3),
-              N = 2)
-```
-
-# A Bayesian model-based network meta-analysis
-
-A common pharmacometric dose–response model is the **Emax model** (see e.g. [Danielle Navarro's](https://blog.djnavarro.net/posts/2024-01-09_emax-models/) and [Kristian Brock's](https://www.kristianbrock.com/post/emax-intro/) smooth introductions to the Emax model), which says the response at dose $D$ follows
-
-\begin{aligned}
-\mu(D) = \frac{E_{\max} \times D}{ED_{50} + D}
-\end{aligned}
-
-where $E_{\max}$ is the asymptotic effect at a very large dose and $ED_{50}$ is the dose at which half of $E_{\max}$ is achieved. We assume that zero dose gives zero placebo-adjusted effect (i.e., the intercept $E_0$ is fixed at 0).
-
-Combining the Emax structure with a meta-analytic likelihood gives the model:
-
-\begin{aligned}
-  Y_{\text{obs}, i}  &\sim \text{Normal}(Y_{\text{true}, i},\ Y_{\text{se}, i}) \\
-  Y_{\text{true}, i} &\sim \text{Normal}(\mu_i,\ \sigma) \\
-  \mu_i              &= \frac{E_{\max} \times D_i}{ED_{50} + D_i} \\
-  E_{\max}           &\sim \text{Normal}(-5.5,\ 0.75) \\
-  \log ED_{50}       &\sim \text{Normal}(-1.5,\ 1) \\
-  \sigma             &\sim \text{Exponential}(4)
-\end{aligned}
-
-The first two lines are a standard random-effects meta-analysis: For the effect of the two dose levels of Drug A, the observed point estimates $Y_{\text{obs}, i}$ are normally distributed around unobserved true study means $Y_{\text{true}, i}$, with each trial's reported standard error $Y_{\text{se}, i}$ reflecting sampling variability. The true means themselves come from a population of true means with mean $\mu$ and between-trial heterogeneity $\sigma$. This notation comes from @mcelreath_statistical_2020 [ch. 15], which frames it as a measurement error model. In the third line, $\mu$ is given its own structural shape, namely the Emax model.
-
-This gives us three parameters -- the $E_{\max}$ and $ED_{50}$ as well as the between-trial heterogeneity $\sigma$ -- to estimate from two data points. But this is no problem for Bayes. The minimum sample size for a Bayesian analysis is 0 (we'll just get the prior back). But it does mean that the priors will exert some influence.
-
-## Setting priors
-We have only two observations on the Drug A dose–response curve, so the priors will matter. In practice, we'd need some clinical guidance and/or previous studies to qualify these choices, but since this is a simulated example, we'll just go with the flow.
-
-Recall that $E_{\max}$ is the asymptotic effect at very large doses. It should be at least as large in magnitude as the largest finite-dose effect observed. The largest observed estimate in our data is $-4.5$, so a prior mean of $-5.5$ allows the asymptote to sit modestly beyond observed effects. The SD of 0.75 acknowledges that the true ceiling could be somewhat larger or smaller, but probably not much smaller than what we've already observed.
-
-$ED_{50}$, the dose that achieves half of $E_{\max}$, has to be positive (we cannot have negative doses), so we model it on the log scale. A prior mean of $-1.5$ on the log scale puts most mass near $\exp(-1.5) \approx 0.22$ mg, which is roughly a fifth of our lowest studied dose -- a reasonable starting guess for a drug whose two studied doses already produce "statistically significant" effects against placebo. The SD of 1 keeps this prior fairly weak.
-
-Finally, $\sigma$. An exponential keeps $\sigma$ non-negative and a rate of 4 gives a prior mean of 0.25 on the effect-measure scale, encoding our expectation that two trials of the same drug at well-characterised doses should not disagree much once dose is accounted for.
-
-While we can quibble about these exact prior choices, let's simulate from them to find out if they give reasonable prior predictions. In a real analysis we would want to do a sensitivity analysis to the priors, especially the prior on $\sigma$ given the very limited data on between-trial variability.
-
-## Prior predictive check
-Before fitting, it's worth seeing what these priors actually imply for the dose–response curve. Below I draw 30 Emax curves with parameters sampled from the priors:
-
-```{r prior-pred, fig.height=4, fig.width=5}
-#| code-fold: true
-#| code-summary: "Show the code"
-library(ggplot2)
-
-set.seed(2)
-n_draws <- 30
-D_grid  <- seq(0, 3, length.out = 200)
-
-draws <- lapply(1:n_draws, function(i) {
-  emax     <- rnorm(1, -5.5, 0.75)
-  log_ed50 <- rnorm(1, -1.5, 1)
-  mu       <- (emax * D_grid) / (exp(log_ed50) + D_grid)
-  data.frame(D = D_grid, y = mu, draw = i)
-})
-prior_df <- do.call(rbind, draws)
-
-mbnma_prior <- ggplot(prior_df, aes(D, y, group = draw)) +
-  geom_line(alpha = 0.3) +
-  labs(x = "Dose (mg)", y = "Placebo-adjusted effect") +
-  scale_y_continuous(breaks = seq(0, -6, by = -1)) +
-  coord_cartesian(ylim = c(-6, 0)) +
-  theme_classic()
-
-mbnma_prior
-```
-
-The curves cover a fairly wide range of plausible Emax shapes, but they're mostly in a sensible ballpark for the effect-size scale.
-
-## Fitting the model
-
-```{r mbnma-fit, output=FALSE, cache=TRUE}
-library(rethinking)
-
-m_mbnma <- ulam(
-  alist(
-    Y_obs ~ normal(Y_true, Y_se),
-    vector[N]:Y_true ~ normal(mu, sigma),
-    mu <- (Emax * D) / (exp(logED50) + D),
-    Emax ~ normal(-5.5, 0.75),
-    logED50 ~ normal(-1.5, 1),
-    sigma ~ exponential(4)
-  ),
-  data = dlist,
-  cores = 4, chains = 4, iter = 4000, seed = 1,
-  control = list(adapt_delta = 0.99, max_treedepth = 12),
-  constraints = list(Emax = "upper=0", sigma = "lower=0"))
-```
-
-Note how the model syntax in `alist()` satisfyingly mirrors the formal model from above. Now, because we have only two data points, I help the sampler along by raising `adapt_delta` and `max_treedepth` and constraining `Emax` to be negative and `sigma` positive. The model gives a warning about some divergent transitions, which we'll come back to. 
-
-```{r mbnma-div}
-divergent(m_mbnma)
-```
-
-First, a quick look at the fit:
-
-```{r mbnma-precis}
-precis(m_mbnma, depth = 2, prob = 0.95)
-```
-
-Sampling looks fine: $\hat R$ close to 1 and ESS ("effective sample size" for the sampler) in the high hundreds or thousands. We get a posterior estimate for each study mean (`Y_true[1]` for the 1 mg trial, `Y_true[2]` for the 2 mg trial) plus the Emax parameters.
-
-## Prior vs. posterior
-A useful diagnostic is to compare priors against posteriors for each parameter. Below, the dashed curve is the prior, and the filled blue density is the posterior.
-
-```{r prior-post, fig.height=3, fig.width=10}
-#| code-fold: true
-#| code-summary: "Show the code"
-post <- extract.samples(m_mbnma)
-n    <- length(post$Emax)
-
-prior_Emax  <- pmin(rnorm(n, -5.5, 0.75), 0)   # respect upper=0 constraint
-prior_ED50  <- exp(rnorm(n, -1.5, 1))
-prior_sigma <- rexp(n, 4)
-
-plot_prior_post <- function(prior, post_samples, title, xlim, add_legend = FALSE) {
-  d_prior <- density(prior, adjust = 1.5)
-  d_post  <- density(post_samples, adjust = 1.5)
-  ylim    <- c(0, max(d_prior$y, d_post$y) * 1.1)
-  
-  plot(NA, xlim = xlim, ylim = ylim,
-       main = title, xlab = "", ylab = "Density",
-       bty = "l")
-  
-  # Posterior: filled steelblue polygon, no border
-  polygon(c(d_post$x[1], d_post$x, d_post$x[length(d_post$x)]),
-          c(0, d_post$y, 0),
-          col = adjustcolor("steelblue", alpha.f = 0.4),
-          border = NA)
-  
-  # Prior: dashed line
-  lines(d_prior, col = "black", lwd = 2, lty = 2)
-  
-  # Free-form labels on first panel only
-  if (add_legend) {
-    idx_prior <- which.max(d_prior$y)
-    text(d_prior$x[idx_prior] * 1.1,
-         d_prior$y[idx_prior] * 1.02,
-         "Prior", col = "black", cex = 1.1)
-    
-    idx_post <- which.max(d_post$y)
-    text(d_post$x[idx_post],
-         d_post$y[idx_post] * 1.075,
-         "Posterior", col = "steelblue", font = 2, cex = 1.1)
-  }
+@Manual{base,
+title = {{R}: A Language and Environment for Statistical Computing},
+  author = {{R Core Team}},
+  organization = {R Foundation for Statistical Computing},
+  address = {Vienna, Austria},
+  year = {2024},
+  url = {https://www.R-project.org/},
+}
+@Manual{base64enc,
+  title = {base64enc: Tools for base64 encoding},
+  author = {Simon Urbanek},
+  year = {2015},
+  note = {R package version 0.1-3},
+  url = {http://www.rforge.net/base64enc},
+}
+@Manual{bslib,
+title = {{bslib}: Custom `{Bootstrap}' `{Sass}' Themes for `{shiny}' and `{rmarkdown}'},
+  author = {Carson Sievert and Joe Cheng and Garrick Aden-Buie},
+  year = {2024},
+  note = {R package version 0.8.0, https://github.com/rstudio/bslib},
+  url = {https://rstudio.github.io/bslib/},
+}
+@Manual{cachem,
+title = {{cachem}: Cache R Objects with Automatic Pruning},
+  author = {Winston Chang},
+  year = {2024},
+  note = {R package version 1.1.0, https://github.com/r-lib/cachem},
+  url = {https://cachem.r-lib.org/},
+}
+@Article{colorspace2020a,
+  title = {{colorspace}: A Toolbox for Manipulating and Assessing Colors and Palettes},
+  author = {Achim Zeileis and Jason C. Fisher and Kurt Hornik and Ross Ihaka and Claire D. McWhite and Paul Murrell and Reto Stauffer and Claus O. Wilke},
+  journal = {Journal of Statistical Software},
+  year = {2020},
+  volume = {96},
+  number = {1},
+  pages = {1--49},
+  doi = {10.18637/jss.v096.i01},
 }
 
-par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+@Article{colorspace2009b,
+  title = {Escaping {RGB}land: Selecting Colors for Statistical Graphics},
+  author = {Achim Zeileis and Kurt Hornik and Paul Murrell},
+  journal = {Computational Statistics \& Data Analysis},
+  year = {2009},
+  volume = {53},
+  number = {9},
+  pages = {3259--3270},
+  doi = {10.1016/j.csda.2008.11.033},
+}
 
-plot_prior_post(prior_Emax,  post$Emax, expression(bold(E[max])),
-                xlim = range(c(prior_Emax, post$Emax)), add_legend = TRUE)
-plot_prior_post(prior_ED50,  exp(post$logED50), expression(bold(ED[50])),
-                xlim = c(0, 1.5))
-plot_prior_post(prior_sigma, post$sigma, expression(bold(sigma)),
-                xlim = c(0, 1))
-```
+@Article{colorspace2009c,
+  title = {Somewhere over the Rainbow: How to Make Effective Use of Colors in Meteorological Visualizations},
+  author = {Reto Stauffer and Georg J. Mayr and Markus Dabernig and Achim Zeileis},
+  journal = {Bulletin of the American Meteorological Society},
+  year = {2009},
+  volume = {96},
+  number = {2},
+  pages = {203--216},
+  doi = {10.1175/BAMS-D-13-00155.1},
+}
+@Manual{digest,
+title = {{digest}: Create Compact Hash Digests of R Objects},
+  author = {Dirk Eddelbuettel},
+  year = {2024},
+  note = {R package version 0.6.37},
+  url = {https://CRAN.R-project.org/package=digest},
+}
+@Manual{evaluate,
+title = {{evaluate}: Parsing and Evaluation Tools that Provide More Details than the
+Default},
+  author = {Hadley Wickham and Yihui Xie},
+  year = {2024},
+  note = {R package version 0.24.0},
+  url = {https://github.com/r-lib/evaluate},
+}
+@Manual{fansi,
+title = {{fansi}: ANSI Control Sequence Aware String Functions},
+  author = {Brodie Gaslam},
+  year = {2023},
+  note = {R package version 1.0.6},
+  url = {https://github.com/brodieG/fansi},
+}
+@Manual{farver,
+title = {{farver}: High Performance Colour Space Manipulation},
+  author = {Thomas Lin Pedersen and Berendea Nicolae and Romain François},
+  year = {2024},
+  note = {R package version 2.1.2},
+  url = {https://CRAN.R-project.org/package=farver},
+}
+@Manual{fastmap,
+title = {{fastmap}: Fast Data Structures},
+  author = {Winston Chang},
+  year = {2024},
+  note = {R package version 1.2.0, https://github.com/r-lib/fastmap},
+  url = {https://r-lib.github.io/fastmap/},
+}
+@Manual{fontawesome,
+title = {{fontawesome}: Easily Work with `{Font Awesome}' Icons},
+  author = {Richard Iannone},
+  year = {2023},
+  note = {R package version 0.5.2, 
+https://rstudio.github.io/fontawesome/},
+  url = {https://github.com/rstudio/fontawesome},
+}
+@Manual{fs,
+title = {{fs}: Cross-Platform File System Operations Based on `{libuv}'},
+  author = {Jim Hester and Hadley Wickham and Gábor Csárdi},
+  year = {2024},
+  note = {R package version 1.6.4, https://github.com/r-lib/fs},
+  url = {https://fs.r-lib.org},
+}
+@Manual{glue,
+title = {{glue}: Interpreted String Literals},
+  author = {Jim Hester and Jennifer Bryan},
+  year = {2024},
+  note = {R package version 1.8.0},
+  url = {https://CRAN.R-project.org/package=glue},
+}
+@Manual{gtable,
+title = {{gtable}: Arrange `{Grobs}' in Tables},
+  author = {Hadley Wickham and Thomas Lin Pedersen},
+  year = {2024},
+  note = {R package version 0.3.6},
+  url = {https://CRAN.R-project.org/package=gtable},
+}
+@Manual{highr,
+title = {{highr}: Syntax Highlighting for R Source Code},
+  author = {Yihui Xie and Yixuan Qiu},
+  year = {2024},
+  note = {R package version 0.11},
+  url = {https://github.com/yihui/highr},
+}
+@Manual{htmltools,
+title = {{htmltools}: Tools for HTML},
+  author = {Joe Cheng and Carson Sievert and Barret Schloerke and Winston Chang and Yihui Xie and Jeff Allen},
+  year = {2024},
+  note = {R package version 0.5.8.1, 
+https://rstudio.github.io/htmltools/},
+  url = {https://github.com/rstudio/htmltools},
+}
+@Manual{isoband,
+title = {{isoband}: Generate Isolines and Isobands from Regularly Spaced Elevation
+Grids},
+  author = {Hadley Wickham and Claus O. Wilke and Thomas Lin Pedersen},
+  year = {2022},
+  note = {R package version 0.2.7},
+  url = {https://CRAN.R-project.org/package=isoband},
+}
+@Manual{jquerylib,
+title = {{jquerylib}: Obtain `{jQuery}' as an HTML Dependency Object},
+  author = {Carson Sievert and Joe Cheng},
+  year = {2021},
+  note = {R package version 0.1.4},
+}
+@Manual{knitr2024,
+title = {{knitr}: A General-Purpose Package for Dynamic Report Generation in R},
+  author = {Yihui Xie},
+  year = {2024},
+  note = {R package version 1.48},
+  url = {https://yihui.org/knitr/},
+}
 
-The model has learned about $E_{\max}$ and $\log ED_{50}$ -- the posteriors are noticeably tighter than the priors. It has learned less about $\sigma$, which is unsurprising: with only two data points, between-study heterogeneity is hard to pin down.
+@Book{knitr2015,
+  title = {Dynamic Documents with {R} and knitr},
+  author = {Yihui Xie},
+  publisher = {Chapman and Hall/CRC},
+  address = {Boca Raton, Florida},
+  year = {2015},
+  edition = {2nd},
+  note = {ISBN 978-1498716963},
+  url = {https://yihui.org/knitr/},
+}
 
-## The Emax curve and shrinkage
+@InCollection{knitr2014,
+  booktitle = {Implementing Reproducible Computational Research},
+  editor = {Victoria Stodden and Friedrich Leisch and Roger D. Peng},
+title = {{knitr}: A Comprehensive Tool for Reproducible Research in {R}},
+  author = {Yihui Xie},
+  publisher = {Chapman and Hall/CRC},
+  year = {2014},
+  note = {ISBN 978-1466561595},
+}
+@Manual{labeling,
+title = {{labeling}: Axis Labeling},
+  author = {Justin Talbot,},
+  year = {2023},
+  note = {R package version 0.4.3},
+  url = {https://CRAN.R-project.org/package=labeling},
+}
+@Manual{lifecycle,
+title = {{lifecycle}: Manage the Life Cycle of your Package Functions},
+  author = {Lionel Henry and Hadley Wickham},
+  year = {2023},
+  note = {R package version 1.0.4},
+  url = {https://CRAN.R-project.org/package=lifecycle},
+}
+@Manual{memoise,
+title = {{memoise}: `{Memoisation}' of Functions},
+  author = {Hadley Wickham and Jim Hester and Winston Chang and Kirill Müller and Daniel Cook},
+  year = {2021},
+  note = {R package version 2.0.1, https://github.com/r-lib/memoise},
+  url = {https://memoise.r-lib.org},
+}
+@Manual{mime,
+title = {{mime}: Map Filenames to MIME Types},
+  author = {Yihui Xie},
+  year = {2021},
+  note = {R package version 0.12},
+  url = {https://github.com/yihui/mime},
+}
+@Manual{munsell,
+title = {{munsell}: Utilities for Using Munsell Colours},
+  author = {Charlotte Wickham},
+  year = {2024},
+  note = {R package version 0.5.1, 
+https://github.com/cwickham/munsell/},
+  url = {https://cran.r-project.org/package=munsell},
+}
+@Manual{patchwork,
+title = {{patchwork}: The Composer of Plots},
+  author = {Thomas Lin Pedersen},
+  year = {2024},
+  note = {R package version 1.2.0, 
+https://github.com/thomasp85/patchwork},
+  url = {https://patchwork.data-imaginist.com},
+}
+@Manual{pkgconfig,
+title = {{pkgconfig}: Private Configuration for `{R}' Packages},
+  author = {Gábor Csárdi},
+  year = {2019},
+  note = {R package version 2.0.3},
+  url = {https://CRAN.R-project.org/package=pkgconfig},
+}
+@Manual{R6,
+  title = {R6: Encapsulated Classes with Reference Semantics},
+  author = {Winston Chang},
+  year = {2025},
+  note = {R package version 2.6.1},
+  url = {https://CRAN.R-project.org/package=R6},
+}
+@Manual{rappdirs,
+title = {{rappdirs}: Application Directories: Determine Where to Save Data, Caches,
+and Logs},
+  author = {Sridhar Ratnakumar and Trent Mick and Trevor Davis},
+  year = {2021},
+  note = {R package version 0.3.3, https://github.com/r-lib/rappdirs},
+  url = {https://rappdirs.r-lib.org},
+}
+@Manual{RColorBrewer,
+title = {{RColorBrewer}: ColorBrewer Palettes},
+  author = {Erich Neuwirth},
+  year = {2022},
+  note = {R package version 1.1-3},
+  url = {https://CRAN.R-project.org/package=RColorBrewer},
+}
+@Manual{remotes,
+title = {{remotes}: R Package Installation from Remote Repositories, Including
+`{GitHub}'},
+  author = {Gábor Csárdi and Jim Hester and Hadley Wickham and Winston Chang and Martin Morgan and Dan Tenenbaum},
+  year = {2024},
+  note = {R package version 2.5.0, https://github.com/r-lib/remotes#readme},
+  url = {https://remotes.r-lib.org},
+}
+@Manual{renv,
+title = {{renv}: Project Environments},
+  author = {Kevin Ushey and Hadley Wickham},
+  year = {2024},
+  note = {R package version 1.0.7, https://github.com/rstudio/renv},
+  url = {https://rstudio.github.io/renv/},
+}
+@Manual{rethinking,
+title = {{rethinking}: Statistical Rethinking book package},
+  author = {Richard McElreath},
+  year = {2024},
+  note = {R package version 2.42, commit ac1b3b2cda83f3e14096e2d997a6e30ad109eeee},
+  url = {https://github.com/rmcelreath/rethinking},
+}
+@Manual{rmarkdown2024,
+title = {{rmarkdown}: Dynamic Documents for R},
+  author = {JJ Allaire and Yihui Xie and Christophe Dervieux and Jonathan McPherson and Javier Luraschi and Kevin Ushey and Aron Atkins and Hadley Wickham and Joe Cheng and Winston Chang and Richard Iannone},
+  year = {2024},
+  note = {R package version 2.27},
+  url = {https://github.com/rstudio/rmarkdown},
+}
 
-Let's plot the posterior Emax curve with the observed data overlaid, alongside the prior predictive from above for comparison:
+@Book{rmarkdown2018,
+  title = {R Markdown: The Definitive Guide},
+  author = {Yihui Xie and J.J. Allaire and Garrett Grolemund},
+  publisher = {Chapman and Hall/CRC},
+  address = {Boca Raton, Florida},
+  year = {2018},
+  isbn = {9781138359338},
+  url = {https://bookdown.org/yihui/rmarkdown},
+}
 
-```{r emax-curve, fig.height=4, fig.width=10}
-#| code-fold: true
-#| code-summary: "Show the code"
-library(patchwork)
+@Book{rmarkdown2020,
+  title = {R Markdown Cookbook},
+  author = {Yihui Xie and Christophe Dervieux and Emily Riederer},
+  publisher = {Chapman and Hall/CRC},
+  address = {Boca Raton, Florida},
+  year = {2020},
+  isbn = {9780367563837},
+  url = {https://bookdown.org/yihui/rmarkdown-cookbook},
+}
+@Manual{sass,
+title = {{sass}: Syntactically Awesome Style Sheets (`{Sass}')},
+  author = {Joe Cheng and Timothy Mastny and Richard Iannone and Barret Schloerke and Carson Sievert},
+  year = {2024},
+  note = {R package version 0.4.9, https://github.com/rstudio/sass},
+  url = {https://rstudio.github.io/sass/},
+}
+@Manual{scales,
+title = {{scales}: Scale Functions for Visualization},
+  author = {Hadley Wickham and Thomas Lin Pedersen and Dana Seidel},
+  year = {2025},
+  note = {R package version 1.4.0},
+  url = {https://CRAN.R-project.org/package=scales},
+}
+@Manual{tinytex2024,
+title = {{tinytex}: Helper Functions to Install and Maintain TeX Live, and Compile
+LaTeX Documents},
+  author = {Yihui Xie},
+  year = {2024},
+  note = {R package version 0.52},
+  url = {https://github.com/rstudio/tinytex},
+}
 
-dose_seq <- seq(0, 3, by = 0.025)
-mu       <- link(m_mbnma, data = list(D = dose_seq))
-
-mu_median <- apply(mu, 2, median)
-mu_PI95   <- apply(mu, 2, PI, prob = 0.95)
-
-plot_data <- data.frame(
-  dose     = dose_seq,
-  median   = mu_median,
-  lower_95 = mu_PI95[1, ],
-  upper_95 = mu_PI95[2, ]
-)
-
-obs_data <- data.frame(
-  dose  = c(1, 2),
-  Y_obs = c(-4, -4.5),
-  Y_sd  = c(0.6, 0.3)
-)
-
-mbnma_post <- ggplot() +
-  # 95% CI ribbon
-  geom_ribbon(data = plot_data,
-              aes(x = dose, ymin = lower_95, ymax = upper_95),
-              fill = "steelblue", alpha = 0.4) +
-  # Posterior median line
-  geom_line(data = plot_data,
-            aes(x = dose, y = median),
-            color = "black", linewidth = 1) +
-  # Observed data with error bars
-  geom_errorbar(data = obs_data,
-                aes(x = dose,
-                    ymin = Y_obs - 1.96 * Y_sd,
-                    ymax = Y_obs + 1.96 * Y_sd),
-                width = 0.08, linewidth = 0.5) +
-  geom_point(data = obs_data,
-             aes(x = dose, y = Y_obs),
-             size = 2, shape = 19) +
-  labs(x = "Dose (mg)", y = "Placebo-adjusted effect") +
-  scale_y_continuous(breaks = seq(0, -6, by = -1)) +
-  scale_x_continuous(breaks = c(0, 1, 2)) +
-  coord_cartesian(ylim = c(-6, 0)) +
-  theme_classic()
-
-mbnma_prior + mbnma_post +
-  plot_annotation(tag_levels = list(c("Prior predictive", "Posterior")))
-```
-
-Two things are worth noting. First, we see that we did manage to increase precision on the target dose of 1 mg. The posterior interval at 1 mg is narrower than the empirical estimates, reflecting the information borrowed from the dose-response curve. Second, our inference on 2 mg remains largely unchanged -- borrowing information from 1 mg does not help us much in getting a more precise estimate for 2 mg. This is because the 2 mg trial was a much larger trial than the 1 mg trial and so there's less to learn from the latter. 
-
-## An improved indirect treatment comparison
-Now, let's query the model about the posterior predictions for Drug A on 1 mg, so that we can plug this updated estimate into our indirect treatment comparison against Drug B 1 mg.
-
-```{r mu1}
-mu_1mg <- link(m_mbnma, data = list(D = 1))
-```
-
-The object `mu_1mg` holds the posterior distribution of predictions for the mean placebo-adjusted effect of 1 mg. We can summarise the distribution using `precis()`.
-
-```{r precismu1}
-precis(data.frame(mu_1mg), prob = 0.95)
-```
-
-Since we now have a full posterior distribution at our disposal, we can do better than the Bucher above. Rather than subtracting point estimates and adding variances algebraically, we approximate the posterior of the Drug B 1 mg estimate as a normal distribution and subtract it sample-by-sample from our posterior draws of the updated Drug A 1 mg estimate. This propagates the full uncertainty from both sources of information and gives us a proper posterior interval for the difference. It also handles any potential skewness in `mu_1mg`.
-
-```{r delta-mbnma}
-delta_mbnma <- mu_1mg - rnorm(length(mu_1mg), mean = -3, sd = 0.2)
-
-data.frame(
-  delta = round(mean(delta_mbnma), 1),
-  ci_lo = round(quantile(delta_mbnma, 0.025), 1),
-  ci_up = round(quantile(delta_mbnma, 0.975), 1))
-```
-
-The point estimate has barely moved -- the Bucher gave $-1$, the MBNMA gives roughly $-1.1$ -- but the intervals are narrower, such that the upper bound of the interval is below 0. We're now more certain that Drug A is more effective than Drug B on average. How certain are we? With a full posterior on hand, we can easily compute the probability that the indirect treatment estimate favors Drug A.
-
-```{r pdelta-mbnma}
-round(mean(delta_mbnma < 0), 2)
-```
-
-Based on this model and data, the posterior probability that Drug A is more effective than Drug B is around 99%.
-
-# Non-centered parameterisation
-
-Now, we have unfinished business with a few divergent transitions. Divergent transitions are basically signals that the sampler had difficulties exploring parts of the posterior. We are ready to tackle those now. 
-
-The model outlined above is what is known as a "centered" parameterisation: each study's true mean $Y_{\text{true}, i}$ is sampled directly from the population distribution:
-
-\begin{aligned}
-Y_{\text{true}, i} \sim \text{Normal}(\mu, \sigma)
-\end{aligned}
-
-This means $Y_{\text{true}, 1}$ and $Y_{\text{true}, 2}$ are
-not independent -- they both depend on $\sigma$, so draws of one tend to move with draws of the other. A pairs plot confirms this: the two study-level parameters show a moderate correlation of around $r = 0.5$ in the centered model. This correlated geometry is harder for the sampler to explore efficiently [@bda3, ch. 13 and 15]. This is the source of our divergent transitions.
-
-```{r pairs-c, fig.height=6, fig.width=8}
-#| code-fold: true
-#| code-summary: "Show the code"
-pairs(m_mbnma)
-```
-
-The fix is what is sometimes referred to as "non-centered" parameterisation [@mcelreath_statistical_2020, ch. 14]. Instead of sampling $Y_{\text{true}, i}$ directly, we introduce a standardised offset $z_i$:
-
-\begin{aligned}
-z_i \sim \text{Normal}(0, 1)
-\end{aligned}
-
-and reconstruct $Y_{\text{true}, i}$ using that offset:
-
-\begin{aligned}
-Y_{\text{true}, i} = \mu_i + \sigma \times z_i
-\end{aligned}
-
-Now $z_1$ and $z_2$ are independent by construction -- $\sigma$ only enters later, when computing $Y_{\text{true}, i}$. Why is this called "non-centered" parameterisation? One way to think of it is with reference to the normal distribution. In the centered parameterisation, the study-level parameters are placed directly at their natural scale -- they are *centered* on their mean $\mu$ with spread $\sigma$. In the non-centered version, we instead sample dimensionless standard normal offsets $z \sim \text{Normal}(0, 1)$ and reconstruct the original parameters as $\mu_i + \sigma \times z_i$, effectively removing the center and scale from the sampling geometry. Anyway, the important thing is that it works. The full non-centered model becomes:
-
-\begin{aligned}
-Y_{\text{obs}, i}  &\sim \text{Normal}(Y_{\text{true}, i},\ Y_{\text{se}, i}) \\
-Y_{\text{true}, i} &= \mu_i + \sigma \times z_i \\
-\mu_i              &= \frac{E_{\max} \times D_i}{ED_{50} + D_i} \\
-z_i                &\sim \text{Normal}(0, 1) \\
-E_{\max}           &\sim \text{Normal}(-5.5,\ 0.75) \\
-\log ED_{50}       &\sim \text{Normal}(-1.5,\ 1) \\
-\sigma             &\sim \text{Exponential}(4)
-\end{aligned}
-
-The key change from the centered model is the second line: $Y_{\text{true}, i}$ goes from being sampled ($\sim$) to being deterministically defined ($=$), as well as the addition of the vector of `z`'s that are given a standardised normal prior. In code:
-
-```{r mbnma-fit-nc, output=FALSE, cache=TRUE}
-m_mbnma_nc <- ulam(
-  alist(
-    Y_obs ~ normal(Y_true, Y_se),
-
-    # non-centered: Y_true is now deterministic
-    vector[N]:Y_true <- mu + sigma * z[i],
-
-    mu <- (Emax * D) / (exp(logED50) + D),
-    vector[N]:z ~ normal(0, 1),
-    Emax ~ normal(-5.5, 0.75),
-    logED50 ~ normal(-1.5, 1),
-    sigma ~ exponential(4)
-  ),
-  data = m_mbnma@data,
-  cores = 4, chains = 4, iter = 4000, seed = 1,
-  control = list(adapt_delta = 0.99, max_treedepth = 12),
-  constraints = list(Emax = "upper=0", sigma = "lower=0"))
-```
-
-We'll first ensure that parameter estimates are the same for the two models -- looks good.
-
-```{r precis_c}
-precis(m_mbnma)
-```
-
-```{r precis_nc}
-precis(m_mbnma_nc)
-```
-
-Let's then check the number of divergent transitions with the non-centered model.
-
-```{r divergent-check}
-divergent(m_mbnma_nc)
-```
-
-Zero divergences. And if we check the pairs plot for the non-centered model, this shows why: the correlation between $z_1$ and $z_2$ is now roughly zero.
-
-```{r pairs-nc, fig.height=6, fig.width=8}
-#| code-fold: true
-#| code-summary: "Show the code"
-pairs(m_mbnma_nc)
-```
-
-The non-centered form of a multilevel model tends to work better when data are sparse, there are few groups, and $\sigma$ is small -- like in our example here. On the other hand, when the data are rich and informative, the centered form works just fine. The non-centered model is very much worth knowing about, and it can be an elegant solution to thorny sampling issues -- @mcelreath_statistical_2020 [ch. 14] goes into quite a bit of detail, including a clear illustration of the funnel geometry and the conditions under which each parameterisation is preferable. The non-centered parameterisation is the default in other popular R interfaces to Stan, such as `rstanarm` [@goodrich2025rstanarm] and `brms` [@burkner2017brms].
-
-# Summary
-Exploiting a dose-response structure rather than ignoring it is one way to get more out of an evidence network. The same principle extends naturally to other dimensions along which trials differ. One such example is follow-up time: if the same treatment has been evaluated at different follow-up times across a set of trials, a longitudinal dose-response-style model can borrow information across time points in the same way we borrowed it across doses [@strathe2025model]. Another extension is "multilevel network meta-regression," which combines individual patient data with aggregate trial data to adjust indirect comparisons for differences in patient-level effect modifiers across trials [@phillippo2020multilevel].
-
-All in all, Bayes is a natural fit for these kinds of models, in that it allows uncertainty to propagate in a principled manner through evidence networks and results in a posterior that allows direct, interpretable, and decision-relevant probability statements about the relative efficacy and safety of competing clinical interventions.
-
-## References
-
-::: {#refs}
-:::
-
-# Software
-
-```{r, cache=TRUE}
-library(grateful)
-pkgs <- cite_packages(output = "table", out.dir = ".", cite.tidyverse = TRUE, dependencies = TRUE)
-knitr::kable(pkgs)
-```
-
-## Session info
-
-```{r}
-sessionInfo()
-```
+@Article{tinytex2019,
+title = {{TinyTeX}: A lightweight, cross-platform, and easy-to-maintain LaTeX distribution based on TeX Live},
+  author = {Yihui Xie},
+  journal = {TUGboat},
+  year = {2019},
+  volume = {40},
+  number = {1},
+  pages = {30--32},
+  url = {https://tug.org/TUGboat/Contents/contents40-1.html},
+}
+@Manual{utf8,
+  title = {utf8: Unicode Text Processing},
+  author = {Patrick O. Perry},
+  year = {2025},
+  note = {R package version 1.2.6},
+  url = {https://CRAN.R-project.org/package=utf8},
+}
+@Manual{vctrs,
+title = {{vctrs}: Vector Helpers},
+  author = {Hadley Wickham and Lionel Henry and Davis Vaughan},
+  year = {2023},
+  note = {R package version 0.6.5},
+  url = {https://CRAN.R-project.org/package=vctrs},
+}
+@Manual{viridisLite,
+  title = {{viridis(Lite)} - Colorblind-Friendly Color Maps for R},
+  author = {{Garnier} and {Simon} and {Ross} and {Noam} and {Rudis} and {Robert} and {Camargo} and Antônio Pedro and {Sciaini} and {Marco} and {Scherer} and {Cédric}},
+  year = {2023},
+  note = {viridisLite package version 0.4.2},
+  url = {https://sjmgarnier.github.io/viridis/},
+  doi = {10.5281/zenodo.4678327},
+}
+@Manual{withr,
+title = {{withr}: Run Code `{With}' Temporarily Modified Global State},
+  author = {Jim Hester and Lionel Henry and Kirill Müller and Kevin Ushey and Hadley Wickham and Winston Chang},
+  year = {2024},
+  note = {R package version 3.0.2},
+  url = {https://CRAN.R-project.org/package=withr},
+}
+@Manual{xfun,
+title = {{xfun}: Supporting Functions for Packages Maintained by `{Yihui Xie}'},
+  author = {Yihui Xie},
+  year = {2024},
+  note = {R package version 0.46},
+  url = {https://github.com/yihui/xfun},
+}
+@Manual{yaml,
+title = {{yaml}: Methods to Convert R Data to YAML and Back},
+  author = {Shawn P Garbett and Jeremy Stephens and Kirill Simonov and Yihui Xie and Zhuoer Dong and Hadley Wickham and Jeffrey Horner and {reikoch} and Will Beasley and Brendan O'Connor and Gregory R. Warnes and Michael Quinn and Zhian N. Kamvar and Charlie Gao},
+  year = {2024},
+  note = {R package version 2.3.10},
+  url = {https://github.com/vubiostat/r-yaml/},
+}
+@Article{tidyverse,
+  title = {Welcome to the {tidyverse}},
+  author = {Hadley Wickham and Mara Averick and Jennifer Bryan and Winston Chang and Lucy D'Agostino McGowan and Romain François and Garrett Grolemund and Alex Hayes and Lionel Henry and Jim Hester and Max Kuhn and Thomas Lin Pedersen and Evan Miller and Stephan Milton Bache and Kirill Müller and Jeroen Ooms and David Robinson and Dana Paige Seidel and Vitalie Spinu and Kohske Takahashi and Davis Vaughan and Claus Wilke and Kara Woo and Hiroaki Yutani},
+  year = {2019},
+  journal = {Journal of Open Source Software},
+  volume = {4},
+  number = {43},
+  pages = {1686},
+  doi = {10.21105/joss.01686},
+}
